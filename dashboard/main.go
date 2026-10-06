@@ -42,7 +42,10 @@ type appModel struct {
 func (m *appModel) reloadPipelineData() {
 	apps := data.ParseApplications(m.careerOpsPath)
 	metrics := data.ComputeMetrics(apps)
-	m.progressMetrics = data.ComputeProgressMetrics(apps)
+	history, historyErr := data.ReadFunnelHistory(m.careerOpsPath)
+	if historyErr == nil {
+		m.progressMetrics = data.ComputeProgressMetrics(apps, history)
+	}
 	m.pipeline = m.pipeline.WithReloadedData(apps, metrics)
 	enrichArchetypes(m.careerOpsPath, apps, &m.pipeline)
 	m.statsMetrics = data.ComputeStatsMetrics(apps)
@@ -52,6 +55,11 @@ func (m *appModel) reloadPipelineData() {
 		if a.Score > 0 {
 			m.evaluatedCount++
 		}
+	}
+	if historyErr != nil {
+		// Refresh current statuses, but retain historical metrics and surface
+		// the failed history read in the TUI after rebuilding the pipeline.
+		m.pipeline, _ = m.pipeline.Update(screens.PipelineHistoryFailedMsg{Err: historyErr.Error()})
 	}
 }
 
@@ -254,7 +262,10 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func openCmd(target string) tea.Cmd {
 	return func() tea.Msg {
 		if err := openWithDefaultApp(target); err != nil {
-			fmt.Fprintf(os.Stderr, "WARN: failed to open %q: %v\n", target, err)
+			// Issue 3913: the dashboard runs with tea.WithAltScreen(), so a
+			// message on stderr is never visible. Report the failure back to
+			// the pipeline screen, which flashes it in the help bar.
+			return screens.PipelineOpenFailedMsg{Target: target, Err: err.Error()}
 		}
 		return nil
 	}
@@ -313,8 +324,52 @@ func (m appModel) View() string {
 	}
 }
 
+func getRepoRoot() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "path-resolver.mjs")); err == nil {
+		return cwd
+	}
+	parent := filepath.Dir(cwd)
+	if _, err := os.Stat(filepath.Join(parent, "path-resolver.mjs")); err == nil {
+		return parent
+	}
+	return cwd
+}
+
+func resolveEnvPath(envVal string) string {
+	trimmed := strings.TrimSpace(envVal)
+	if trimmed == "" {
+		return ""
+	}
+	if filepath.IsAbs(trimmed) {
+		return filepath.Clean(trimmed)
+	}
+	return filepath.Clean(filepath.Join(getRepoRoot(), trimmed))
+}
+
 func main() {
-	pathFlag := flag.String("path", ".", "Path to career-ops directory")
+	defaultPath := getRepoRoot()
+	if envPath := resolveEnvPath(os.Getenv("CAREER_OPS_ROOT")); envPath != "" {
+		defaultPath = envPath
+	} else if envPath := resolveEnvPath(os.Getenv("CAREER_OPS_DATA_DIR")); envPath != "" {
+		defaultPath = envPath
+	} else {
+		markerFile := filepath.Join(getRepoRoot(), ".career-ops-data")
+		if content, err := os.ReadFile(markerFile); err == nil {
+			trimmed := strings.TrimSpace(string(content))
+			if trimmed != "" {
+				if filepath.IsAbs(trimmed) {
+					defaultPath = filepath.Clean(trimmed)
+				} else {
+					defaultPath = filepath.Clean(filepath.Join(getRepoRoot(), trimmed))
+				}
+			}
+		}
+	}
+	pathFlag := flag.String("path", defaultPath, "Path to career-ops directory")
 	langFlag := flag.String("lang", "", "Language for UI (en, tr). Defaults to auto-detect/en.")
 	flag.Parse()
 
@@ -334,8 +389,13 @@ func main() {
 	}
 
 	// Compute metrics
+	history, err := data.ReadFunnelHistory(careerOpsPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 	metrics := data.ComputeMetrics(apps)
-	progressMetrics := data.ComputeProgressMetrics(apps)
+	progressMetrics := data.ComputeProgressMetrics(apps, history)
 
 	// Batch-load all report summaries
 	t := theme.NewTheme("auto")
@@ -350,7 +410,7 @@ func main() {
 		theme:           t,
 		progressMetrics: progressMetrics,
 		statsMetrics:    statsMetrics,
-		evaluatedCount:  func() int {
+		evaluatedCount: func() int {
 			n := 0
 			for _, a := range apps {
 				if a.Score > 0 {
